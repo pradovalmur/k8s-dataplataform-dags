@@ -1,34 +1,40 @@
-# dags/operacoes.py
+# dags/td_operacoes_taskflow.py
 from __future__ import annotations
 
 import io
 import re
-from datetime import datetime
+from datetime import datetime, date
+from typing import List, Dict
 
 import pandas as pd
 import pyarrow as pa
 import pyarrow.parquet as pq
 import s3fs
+import trino
 
 from airflow import DAG
+from airflow.decorators import task
 from airflow.models import Variable
-from airflow.operators.python import PythonOperator
 
 
 # ---------- Config (Airflow Variables) ----------
 S3_ACCESS_KEY = Variable.get("S3_ACCESS_KEY").strip()
 S3_SECRET_KEY = Variable.get("S3_SECRET_KEY").strip()
-S3_ENDPOINT = Variable.get(
-    "S3_ENDPOINT",
-    default_var="http://minio.minio.svc.cluster.local:9000",
-).strip()
+S3_ENDPOINT = Variable.get("S3_ENDPOINT", default_var="http://minio.minio.svc.cluster.local:9000").strip()
 
 BUCKET = Variable.get("TD_BUCKET", default_var="analytics").strip()
-
 RAW_PREFIX = Variable.get("TD_RAW_PREFIX", default_var="raw/tesouro_direto/operacoes/").strip()
-STG_PREFIX = Variable.get("TD_STG_PREFIX", default_var="staging/tesouro_direto/operacoes_parquet/").strip()
 
-# 0 = processa tudo
+TMP_PREFIX = Variable.get("TD_TMP_PREFIX", default_var="tmp/tesouro_direto/operacoes_parquet/").strip()
+
+TRINO_HOST = Variable.get("TRINO_HOST", default_var="trino-coordinator.analytics.svc.cluster.local").strip()
+TRINO_PORT = int(Variable.get("TRINO_PORT", default_var="8080"))
+TRINO_USER = Variable.get("TRINO_USER", default_var="airflow").strip()
+
+ICEBERG_CATALOG = Variable.get("ICEBERG_CATALOG", default_var="iceberg").strip()
+ICEBERG_SCHEMA = Variable.get("ICEBERG_SCHEMA", default_var="analytics").strip()
+ICEBERG_TABLE = Variable.get("ICEBERG_TABLE", default_var="td_operacoes").strip()
+
 ONLY_NEWER_THAN_DAYS = int(Variable.get("TD_ONLY_NEWER_THAN_DAYS", default_var="0"))
 
 
@@ -41,8 +47,23 @@ def snake_case(s: str) -> str:
     return s.strip("_").lower()
 
 
+def parse_month_from_filename(filename: str) -> tuple[int, int]:
+    m = re.search(r"(\d{4})-(\d{2})", filename)
+    if not m:
+        raise ValueError(f"Não consegui extrair YYYY-MM do filename: {filename}")
+    return int(m.group(1)), int(m.group(2))
+
+
+def month_range(year: int, month: int) -> tuple[date, date]:
+    start = date(year, month, 1)
+    if month == 12:
+        end = date(year + 1, 1, 1)
+    else:
+        end = date(year, month + 1, 1)
+    return start, end
+
+
 def get_fs() -> s3fs.S3FileSystem:
-    # MinIO: força signature v4 e endpoint custom
     return s3fs.S3FileSystem(
         key=S3_ACCESS_KEY,
         secret=S3_SECRET_KEY,
@@ -51,170 +72,216 @@ def get_fs() -> s3fs.S3FileSystem:
     )
 
 
-def list_csv_files(fs: s3fs.S3FileSystem, bucket: str, prefix: str) -> list[str]:
-    base = f"{bucket}/{prefix}".rstrip("/") + "/"
-    files = fs.glob(base + "*.csv")
-    return sorted(files)
+def connect_trino() -> trino.dbapi.Connection:
+    return trino.dbapi.connect(
+        host=TRINO_HOST,
+        port=TRINO_PORT,
+        user=TRINO_USER,
+        http_scheme="http",
+    )
 
 
-def should_process(fs: s3fs.S3FileSystem, path: str) -> bool:
-    if ONLY_NEWER_THAN_DAYS <= 0:
-        return True
+def ensure_iceberg_table(cur) -> None:
+    cur.execute(f"CREATE SCHEMA IF NOT EXISTS {ICEBERG_CATALOG}.{ICEBERG_SCHEMA}")
 
-    info = fs.info(path)
-    mtime = info.get("LastModified") or info.get("last_modified") or info.get("mtime")
-    if mtime is None:
-        return True
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {ICEBERG_CATALOG}.{ICEBERG_SCHEMA}.{ICEBERG_TABLE} (
+          codigo_do_investidor VARCHAR,
+          data_da_operacao DATE,
+          tipo_titulo VARCHAR,
+          vencimento_do_titulo DATE,
+          quantidade DOUBLE,
+          valor_do_titulo DOUBLE,
+          valor_da_operacao DOUBLE,
+          tipo_da_operacao VARCHAR,
+          canal_da_operacao VARCHAR
+        )
+        WITH (
+          format = 'PARQUET',
+          partitioning = ARRAY['month(data_da_operacao)']
+        )
+        """
+    )
 
-    # best-effort timestamp
-    try:
-        ts = mtime.timestamp()
-    except Exception:
-        return True
 
-    cutoff = datetime.utcnow().timestamp() - ONLY_NEWER_THAN_DAYS * 86400
-    return ts >= cutoff
+def transform_csv_bytes(raw: bytes) -> pa.Table:
+    df = pd.read_csv(io.BytesIO(raw), sep=";", encoding="latin-1", dtype=str)
+    df.columns = [snake_case(c) for c in df.columns]
 
+    if "data_da_operacao" not in df.columns:
+        raise ValueError(f"Coluna 'Data da Operacao' não encontrada. Colunas: {list(df.columns)}")
 
-def normalize_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
-    # datas (sem timezone)
-    for c in ["data_da_operacao", "vencimento_do_titulo"]:
-        if c in df.columns:
-            df[c] = pd.to_datetime(df[c], errors="coerce").dt.tz_localize(None)
+    df["data_da_operacao"] = pd.to_datetime(df["data_da_operacao"], format="%d/%m/%Y", errors="coerce")
+    if "vencimento_do_titulo" in df.columns:
+        df["vencimento_do_titulo"] = pd.to_datetime(df["vencimento_do_titulo"], format="%d/%m/%Y", errors="coerce")
+
+    def to_float(col: str) -> None:
+        if col in df.columns:
+            s = df[col].astype(str).str.replace(".", "", regex=False).str.replace(",", ".", regex=False)
+            df[col] = pd.to_numeric(s, errors="coerce").astype("float64")
+
+    to_float("quantidade")
+    to_float("valor_do_titulo")
+    to_float("valor_da_operacao")
 
     # strings
-    for c in ["codigo_do_investidor", "tipo_titulo", "tipo_da_operacao", "canal_da_operacao"]:
-        if c in df.columns:
-            df[c] = df[c].astype("string")
+    for col in ["codigo_do_investidor", "tipo_titulo", "tipo_da_operacao", "canal_da_operacao"]:
+        if col in df.columns:
+            df[col] = df[col].astype("string")
 
-    # números (double)
-    for c in ["quantidade", "valor_do_titulo", "valor_da_operacao"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+    # datas -> date
+    df["data_da_operacao"] = pd.to_datetime(df["data_da_operacao"], errors="coerce").dt.date
+    if "vencimento_do_titulo" in df.columns:
+        df["vencimento_do_titulo"] = pd.to_datetime(df["vencimento_do_titulo"], errors="coerce").dt.date
 
-    # partições (garante que não vira dtype problemático pro pyarrow)
-    for c in ["op_year", "op_month"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64").astype("float64")
+    df = df.dropna(subset=["data_da_operacao"])
 
-    return df
+    cols = [
+        "codigo_do_investidor",
+        "data_da_operacao",
+        "tipo_titulo",
+        "vencimento_do_titulo",
+        "quantidade",
+        "valor_do_titulo",
+        "valor_da_operacao",
+        "tipo_da_operacao",
+        "canal_da_operacao",
+    ]
+    for c in cols:
+        if c not in df.columns:
+            df[c] = pd.NA
 
-
-def transform_and_write_parquet(**context) -> None:
-    fs = get_fs()
-
-    in_files = list_csv_files(fs, BUCKET, RAW_PREFIX)
-    if not in_files:
-        print(f"Nenhum CSV encontrado em s3://{BUCKET}/{RAW_PREFIX}")
-        return
-
-    print("Config:")
-    print("  S3_ENDPOINT =", S3_ENDPOINT)
-    print("  BUCKET =", BUCKET)
-    print("  RAW_PREFIX =", RAW_PREFIX)
-    print("  STG_PREFIX =", STG_PREFIX)
-    print("  files =", len(in_files))
-
-    for in_path in in_files:
-        if not should_process(fs, in_path):
-            continue
-
-        filename = in_path.split("/")[-1]
-        print(f"\nProcessando: s3://{in_path}")
-
-        # --- read CSV (pt-BR, ;, latin-1) ---
-        with fs.open(in_path, "rb") as f:
-            raw = f.read()
-
-        df = pd.read_csv(
-            io.BytesIO(raw),
-            sep=";",
-            encoding="latin-1",
-            dtype=str,  # primeiro como string
-        )
-
-        # --- normalize headers ---
-        df.columns = [snake_case(c) for c in df.columns]
-
-        # --- rename to friendly final names (opcional, mas ajuda) ---
-        # mapeia nomes comuns do dataset
-        rename_map = {
-            "codigo_do_investidor": "codigo_do_investidor",
-            "data_da_operacao": "data_da_operacao",
-            "tipo_titulo": "tipo_titulo",
-            "vencimento_do_titulo": "vencimento_do_titulo",
-            "quantidade": "quantidade",
-            "valor_do_titulo": "valor_do_titulo",
-            "valor_da_operacao": "valor_da_operacao",
-            "tipo_da_operacao": "tipo_da_operacao",
-            "canal_da_operacao": "canal_da_operacao",
-        }
-        df = df.rename(columns=rename_map)
-
-        if "data_da_operacao" not in df.columns:
-            raise ValueError(f"Coluna 'Data da Operacao' não encontrada. Colunas: {list(df.columns)}")
-
-        # --- parse dates ---
-        df["data_da_operacao"] = pd.to_datetime(df["data_da_operacao"], format="%d/%m/%Y", errors="coerce")
-        if "vencimento_do_titulo" in df.columns:
-            df["vencimento_do_titulo"] = pd.to_datetime(df["vencimento_do_titulo"], format="%d/%m/%Y", errors="coerce")
-
-        # --- parse numbers with pt-BR decimals ---
-        def to_float(col: str) -> None:
-            if col in df.columns:
-                s = df[col].astype(str)
-                s = s.str.replace(".", "", regex=False)   # milhar
-                s = s.str.replace(",", ".", regex=False)  # decimal
-                df[col] = pd.to_numeric(s, errors="coerce")
-
-        to_float("quantidade")
-        to_float("valor_do_titulo")
-        to_float("valor_da_operacao")
-
-        # remove linhas sem data
-        df = df.dropna(subset=["data_da_operacao"])
-
-        # --- derive partitions (year/month) from data_da_operacao ---
-        df["op_year"] = df["data_da_operacao"].dt.year
-        df["op_month"] = df["data_da_operacao"].dt.month
-
-        # --- final normalize for pyarrow ---
-        df = normalize_for_arrow(df)
-
-        # debug leve (ajuda se quebrar de novo)
-        print("dtypes:")
-        print(df.dtypes)
-
-        # cria table com safe=False para evitar erro por casts “estritos”
-        table = pa.Table.from_pandas(df, preserve_index=False, safe=False)
-
-        # --- write parquet partitioned by year/month ---
-        out_root = f"{BUCKET}/{STG_PREFIX}".rstrip("/")
-
-        pq.write_to_dataset(
-            table,
-            root_path=out_root,
-            filesystem=fs,
-            partition_cols=["op_year", "op_month"],
-            basename_template=filename.replace(".csv", "") + "-{i}.parquet",
-            use_dictionary=True,
-            compression="snappy",
-        )
-
-        print(f"OK -> s3://{out_root} (partitioned op_year/op_month)")
+    df = df[cols]
+    return pa.Table.from_pandas(df, preserve_index=False, safe=False)
 
 
 with DAG(
-    dag_id="td_operacoes_raw_to_parquet",
+    dag_id="td_operacoes_raw_to_iceberg_taskflow",
     start_date=datetime(2026, 1, 1),
-    schedule=None,  # on-demand
+    schedule=None,
     catchup=False,
-    tags=["tesouro-direto", "raw-to-parquet"],
+    tags=["tesouro-direto", "taskflow", "iceberg"],
     default_args={"owner": "airflow", "retries": 1},
 ) as dag:
-    raw_to_parquet = PythonOperator(
-        task_id="raw_csv_to_parquet_partitioned",
-        python_callable=transform_and_write_parquet,
-    )
 
-    raw_to_parquet
+    @task
+    def discover_files() -> List[Dict]:
+        fs = get_fs()
+        base = f"{BUCKET}/{RAW_PREFIX}".rstrip("/") + "/"
+        files = sorted(fs.glob(base + "*.csv"))
+        if not files:
+            return []
+
+        out = []
+        for p in files:
+            filename = p.split("/")[-1]
+            year, month = parse_month_from_filename(filename)
+            out.append({"path": p, "filename": filename, "year": year, "month": month})
+        return out
+
+    @task
+    def extract_transform_to_tmp(fileinfo: Dict) -> Dict:
+        fs = get_fs()
+        path = fileinfo["path"]
+        filename = fileinfo["filename"]
+        year = int(fileinfo["year"])
+        month = int(fileinfo["month"])
+
+        with fs.open(path, "rb") as f:
+            raw = f.read()
+
+        table = transform_csv_bytes(raw)
+
+        tmp_key = f"{TMP_PREFIX}".rstrip("/") + f"/year={year:04d}/month={month:02d}/{filename.replace('.csv','')}.parquet"
+        tmp_path = f"{BUCKET}/{tmp_key}"
+
+        # escreve um único parquet por arquivo
+        with fs.open(tmp_path, "wb") as out:
+            pq.write_table(table, out, compression="snappy")
+
+        return {
+            "year": year,
+            "month": month,
+            "tmp_path": tmp_path,   # sem s3://, formato s3fs
+            "rows": table.num_rows,
+        }
+
+    @task
+    def load_tmp_into_iceberg(item: Dict) -> str:
+        year = int(item["year"])
+        month = int(item["month"])
+        tmp_path = item["tmp_path"]
+
+        start, end = month_range(year, month)
+
+        conn = connect_trino()
+        cur = conn.cursor()
+
+        ensure_iceberg_table(cur)
+
+        # idempotência por mês
+        cur.execute(
+            f"""
+            DELETE FROM {ICEBERG_CATALOG}.{ICEBERG_SCHEMA}.{ICEBERG_TABLE}
+            WHERE data_da_operacao >= DATE '{start.isoformat()}'
+              AND data_da_operacao <  DATE '{end.isoformat()}'
+            """
+        )
+
+        # lê parquet tmp no Python e insere no Iceberg
+        # (sem hive: Trino não lê parquet solto. então inserimos via executemany)
+        fs = get_fs()
+        with fs.open(tmp_path, "rb") as f:
+            t = pq.read_table(f)
+        df = t.to_pandas()
+
+        insert_sql = f"""
+        INSERT INTO {ICEBERG_CATALOG}.{ICEBERG_SCHEMA}.{ICEBERG_TABLE} (
+          codigo_do_investidor,
+          data_da_operacao,
+          tipo_titulo,
+          vencimento_do_titulo,
+          quantidade,
+          valor_do_titulo,
+          valor_da_operacao,
+          tipo_da_operacao,
+          canal_da_operacao
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """.strip()
+
+        rows = [
+            (
+                r["codigo_do_investidor"],
+                r["data_da_operacao"],
+                r["tipo_titulo"],
+                r["vencimento_do_titulo"],
+                float(r["quantidade"]) if r["quantidade"] is not None else None,
+                float(r["valor_do_titulo"]) if r["valor_do_titulo"] is not None else None,
+                float(r["valor_da_operacao"]) if r["valor_da_operacao"] is not None else None,
+                r["tipo_da_operacao"],
+                r["canal_da_operacao"],
+            )
+            for r in df.to_dict(orient="records")
+        ]
+
+        chunk = 2000
+        for i in range(0, len(rows), chunk):
+            cur.executemany(insert_sql, rows[i : i + chunk])
+
+        cur.close()
+        conn.close()
+        return f"loaded {len(rows)} rows for {year}-{month:02d}"
+
+    @task
+    def cleanup_tmp(item: Dict) -> None:
+        fs = get_fs()
+        try:
+            fs.rm(item["tmp_path"])
+        except Exception as e:
+            print("cleanup warn:", e)
+
+    files = discover_files()
+    transformed = extract_transform_to_tmp.expand(fileinfo=files)
+    loaded = load_tmp_into_iceberg.expand(item=transformed)
+    cleanup_tmp.expand(item=transformed)
