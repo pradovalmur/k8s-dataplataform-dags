@@ -1,36 +1,36 @@
-# dags/td_operacoes_raw_to_parquet.py
+# dags/operacoes.py
 from __future__ import annotations
 
 import io
-import os
 import re
 from datetime import datetime
 
 import pandas as pd
-import pyarrow as pas
+import pyarrow as pa
 import pyarrow.parquet as pq
 import s3fs
 
 from airflow import DAG
-from airflow.operators.python import PythonOperator
 from airflow.models import Variable
+from airflow.operators.python import PythonOperator
 
 
-# ---------- Config ----------
-S3_ACCESS_KEY = Variable.get("S3_ACCESS_KEY")
-S3_SECRET_KEY = Variable.get("S3_SECRET_KEY")
+# ---------- Config (Airflow Variables) ----------
+S3_ACCESS_KEY = Variable.get("S3_ACCESS_KEY").strip()
+S3_SECRET_KEY = Variable.get("S3_SECRET_KEY").strip()
 S3_ENDPOINT = Variable.get(
     "S3_ENDPOINT",
-    default_var="http://minio.minio.svc.cluster.local:9000"
-)
+    default_var="http://minio.minio.svc.cluster.local:9000",
+).strip()
 
-BUCKET = os.environ.get("TD_BUCKET", "analytics")
+BUCKET = Variable.get("TD_BUCKET", default_var="analytics").strip()
 
-RAW_PREFIX = os.environ.get("TD_RAW_PREFIX", "raw/tesouro_direto/operacoes/")
-STG_PREFIX = os.environ.get("TD_STG_PREFIX", "staging/tesouro_direto/operacoes_parquet/")
+RAW_PREFIX = Variable.get("TD_RAW_PREFIX", default_var="raw/tesouro_direto/operacoes/").strip()
+STG_PREFIX = Variable.get("TD_STG_PREFIX", default_var="staging/tesouro_direto/operacoes_parquet/").strip()
 
-# opcional: processar só arquivos recentes (dias)
-ONLY_NEWER_THAN_DAYS = int(os.environ.get("TD_ONLY_NEWER_THAN_DAYS", "0"))
+# 0 = processa tudo
+ONLY_NEWER_THAN_DAYS = int(Variable.get("TD_ONLY_NEWER_THAN_DAYS", default_var="0"))
+
 
 # ---------- Helpers ----------
 def snake_case(s: str) -> str:
@@ -42,16 +42,17 @@ def snake_case(s: str) -> str:
 
 
 def get_fs() -> s3fs.S3FileSystem:
+    # MinIO: força signature v4 e endpoint custom
     return s3fs.S3FileSystem(
         key=S3_ACCESS_KEY,
         secret=S3_SECRET_KEY,
         client_kwargs={"endpoint_url": S3_ENDPOINT},
+        config_kwargs={"signature_version": "s3v4"},
     )
 
 
 def list_csv_files(fs: s3fs.S3FileSystem, bucket: str, prefix: str) -> list[str]:
     base = f"{bucket}/{prefix}".rstrip("/") + "/"
-    # s3fs expects paths without s3://
     files = fs.glob(base + "*.csv")
     return sorted(files)
 
@@ -59,39 +60,67 @@ def list_csv_files(fs: s3fs.S3FileSystem, bucket: str, prefix: str) -> list[str]
 def should_process(fs: s3fs.S3FileSystem, path: str) -> bool:
     if ONLY_NEWER_THAN_DAYS <= 0:
         return True
+
     info = fs.info(path)
-    # mtime may be string or datetime-like depending on backend
     mtime = info.get("LastModified") or info.get("last_modified") or info.get("mtime")
     if mtime is None:
         return True
-    if isinstance(mtime, str):
-        # best-effort parse
-        try:
-            mtime = datetime.fromisoformat(mtime.replace("Z", "+00:00"))
-        except Exception:
-            return True
-    cutoff = datetime.utcnow().timestamp() - ONLY_NEWER_THAN_DAYS * 86400
+
+    # best-effort timestamp
     try:
         ts = mtime.timestamp()
     except Exception:
         return True
+
+    cutoff = datetime.utcnow().timestamp() - ONLY_NEWER_THAN_DAYS * 86400
     return ts >= cutoff
+
+
+def normalize_for_arrow(df: pd.DataFrame) -> pd.DataFrame:
+    # datas (sem timezone)
+    for c in ["data_da_operacao", "vencimento_do_titulo"]:
+        if c in df.columns:
+            df[c] = pd.to_datetime(df[c], errors="coerce").dt.tz_localize(None)
+
+    # strings
+    for c in ["codigo_do_investidor", "tipo_titulo", "tipo_da_operacao", "canal_da_operacao"]:
+        if c in df.columns:
+            df[c] = df[c].astype("string")
+
+    # números (double)
+    for c in ["quantidade", "valor_do_titulo", "valor_da_operacao"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
+
+    # partições (garante que não vira dtype problemático pro pyarrow)
+    for c in ["op_year", "op_month"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce").astype("Int64").astype("float64")
+
+    return df
 
 
 def transform_and_write_parquet(**context) -> None:
     fs = get_fs()
-    in_files = list_csv_files(fs, BUCKET, RAW_PREFIX)
 
+    in_files = list_csv_files(fs, BUCKET, RAW_PREFIX)
     if not in_files:
         print(f"Nenhum CSV encontrado em s3://{BUCKET}/{RAW_PREFIX}")
         return
+
+    print("Config:")
+    print("  S3_ENDPOINT =", S3_ENDPOINT)
+    print("  BUCKET =", BUCKET)
+    print("  RAW_PREFIX =", RAW_PREFIX)
+    print("  STG_PREFIX =", STG_PREFIX)
+    print("  files =", len(in_files))
 
     for in_path in in_files:
         if not should_process(fs, in_path):
             continue
 
-        filename = os.path.basename(in_path)  # ex: operacoes_2015-07.csv
-        print(f"Processando: s3://{in_path}")
+        filename = in_path.split("/")[-1]
+        print(f"\nProcessando: s3://{in_path}")
 
         # --- read CSV (pt-BR, ;, latin-1) ---
         with fs.open(in_path, "rb") as f:
@@ -101,63 +130,70 @@ def transform_and_write_parquet(**context) -> None:
             io.BytesIO(raw),
             sep=";",
             encoding="latin-1",
-            dtype=str,  # primeiro como string para evitar dor de cabeça
+            dtype=str,  # primeiro como string
         )
 
         # --- normalize headers ---
         df.columns = [snake_case(c) for c in df.columns]
 
-        # expected columns (from your sample) after snake_case:
-        # codigo_do_investidor, data_da_operacao, tipo_titulo, vencimento_do_titulo,
-        # quantidade, valor_do_titulo, valor_da_operacao, tipo_da_operacao, canal_da_operacao
+        # --- rename to friendly final names (opcional, mas ajuda) ---
+        # mapeia nomes comuns do dataset
+        rename_map = {
+            "codigo_do_investidor": "codigo_do_investidor",
+            "data_da_operacao": "data_da_operacao",
+            "tipo_titulo": "tipo_titulo",
+            "vencimento_do_titulo": "vencimento_do_titulo",
+            "quantidade": "quantidade",
+            "valor_do_titulo": "valor_do_titulo",
+            "valor_da_operacao": "valor_da_operacao",
+            "tipo_da_operacao": "tipo_da_operacao",
+            "canal_da_operacao": "canal_da_operacao",
+        }
+        df = df.rename(columns=rename_map)
 
-        # --- parse / cast ---
-        if "data_da_operacao" in df.columns:
-            df["data_da_operacao"] = pd.to_datetime(df["data_da_operacao"], format="%d/%m/%Y", errors="coerce")
+        if "data_da_operacao" not in df.columns:
+            raise ValueError(f"Coluna 'Data da Operacao' não encontrada. Colunas: {list(df.columns)}")
+
+        # --- parse dates ---
+        df["data_da_operacao"] = pd.to_datetime(df["data_da_operacao"], format="%d/%m/%Y", errors="coerce")
         if "vencimento_do_titulo" in df.columns:
             df["vencimento_do_titulo"] = pd.to_datetime(df["vencimento_do_titulo"], format="%d/%m/%Y", errors="coerce")
 
-        # números com vírgula decimal
+        # --- parse numbers with pt-BR decimals ---
         def to_float(col: str) -> None:
             if col in df.columns:
-                df[col] = (
-                    df[col]
-                    .astype(str)
-                    .str.replace(".", "", regex=False)   # se vier separador de milhar
-                    .str.replace(",", ".", regex=False)  # decimal pt-BR -> en-US
-                )
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+                s = df[col].astype(str)
+                s = s.str.replace(".", "", regex=False)   # milhar
+                s = s.str.replace(",", ".", regex=False)  # decimal
+                df[col] = pd.to_numeric(s, errors="coerce")
 
         to_float("quantidade")
         to_float("valor_do_titulo")
         to_float("valor_da_operacao")
 
-        # strings úteis
-        for col in ["codigo_do_investidor", "tipo_titulo", "tipo_da_operacao", "canal_da_operacao"]:
-            if col in df.columns:
-                df[col] = df[col].astype("string")
+        # remove linhas sem data
+        df = df.dropna(subset=["data_da_operacao"])
 
         # --- derive partitions (year/month) from data_da_operacao ---
-        if "data_da_operacao" not in df.columns:
-            raise ValueError("Coluna 'data_da_operacao' não encontrada após normalização.")
+        df["op_year"] = df["data_da_operacao"].dt.year
+        df["op_month"] = df["data_da_operacao"].dt.month
 
-        df = df.dropna(subset=["data_da_operacao"])
-        df["op_year"] = df["data_da_operacao"].dt.year.astype("int32")
-        df["op_month"] = df["data_da_operacao"].dt.month.astype("int8")
+        # --- final normalize for pyarrow ---
+        df = normalize_for_arrow(df)
+
+        # debug leve (ajuda se quebrar de novo)
+        print("dtypes:")
+        print(df.dtypes)
+
+        # cria table com safe=False para evitar erro por casts “estritos”
+        table = pa.Table.from_pandas(df, preserve_index=False, safe=False)
 
         # --- write parquet partitioned by year/month ---
-        # output path example:
-        # s3://analytics/staging/tesouro_direto/operacoes_parquet/op_year=2015/op_month=7/operacoes_2015-07.parquet
-        # using pyarrow for stable partitioning
-        table = pa.Table.from_pandas(df, preserve_index=False)
+        out_root = f"{BUCKET}/{STG_PREFIX}".rstrip("/")
 
-        out_dir = f"{BUCKET}/{STG_PREFIX}".rstrip("/")  # no s3://
-        ensure_dirs = True  # s3 doesn't need, but keeps intention
-
-        # write_dataset partitions
         pq.write_to_dataset(
             table,
-            root_path=out_dir,
+            root_path=out_root,
             filesystem=fs,
             partition_cols=["op_year", "op_month"],
             basename_template=filename.replace(".csv", "") + "-{i}.parquet",
@@ -165,14 +201,13 @@ def transform_and_write_parquet(**context) -> None:
             compression="snappy",
         )
 
-        print(f"OK -> s3://{out_dir} (partitioned op_year/op_month)")
+        print(f"OK -> s3://{out_root} (partitioned op_year/op_month)")
 
 
-# ---------- DAG ----------
 with DAG(
     dag_id="td_operacoes_raw_to_parquet",
     start_date=datetime(2026, 1, 1),
-    schedule=None,  # manual / on-demand
+    schedule=None,  # on-demand
     catchup=False,
     tags=["tesouro-direto", "raw-to-parquet"],
     default_args={"owner": "airflow", "retries": 1},
