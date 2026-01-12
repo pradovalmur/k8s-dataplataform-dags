@@ -13,12 +13,16 @@ import s3fs
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
+from airflow.models import Variable
 
 
 # ---------- Config ----------
-S3_ENDPOINT = os.environ.get("S3_ENDPOINT", "http://minio.minio.svc.cluster.local:9000")
-S3_ACCESS_KEY = os.environ["S3_ACCESS_KEY"]
-S3_SECRET_KEY = os.environ["S3_SECRET_KEY"]
+S3_ACCESS_KEY = Variable.get("S3_ACCESS_KEY")
+S3_SECRET_KEY = Variable.get("S3_SECRET_KEY")
+S3_ENDPOINT = Variable.get(
+    "S3_ENDPOINT",
+    default_var="http://minio.minio.svc.cluster.local:9000"
+)
 
 BUCKET = os.environ.get("TD_BUCKET", "analytics")
 
