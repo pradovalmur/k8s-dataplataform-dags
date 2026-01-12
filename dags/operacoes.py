@@ -284,4 +284,6 @@ with DAG(
     files = discover_files()
     transformed = extract_transform_to_tmp.expand(fileinfo=files)
     loaded = load_tmp_into_iceberg.expand(item=transformed)
-    cleanup_tmp.expand(item=transformed)
+
+    # cleanup só depois do load terminar (por map-index)
+    cleanup_tmp.expand(item=transformed).set_upstream(loaded)
