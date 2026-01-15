@@ -23,22 +23,22 @@ def _s3_fs() -> s3fs.S3FileSystem:
     )
 
 @dag(
-    dag_id="ipma_stations_raw_to_minio_parquet",
+    dag_id="ipma_stations",
     schedule="0 2 * * *",
     start_date=datetime(2025, 1, 1),
     catchup=False,
     default_args={"retries": 2, "retry_delay": timedelta(minutes=5)},
-    tags=["ipma", "raw", "minio", "stations", "parquet"],
+    tags=["ipma", "stations"],
 )
-def ipma_stations_raw_to_minio_parquet():
+def ipma_stations():
     @task
     def check_api() -> int:
-        r = requests.get(IPMA_URL, timeout=60)
+        r = requests.get(IPMA_URL, timeout=20)
         r.raise_for_status()
         return r.status_code
 
     @task
-    def fetch() -> list[dict]:
+    def fetch(_: int) -> list[dict]:
         r = requests.get(IPMA_URL, timeout=60)
         r.raise_for_status()
         data = r.json()
@@ -68,6 +68,8 @@ def ipma_stations_raw_to_minio_parquet():
 
         return {"rows": int(len(df)), "path": f"s3://{path}"}
 
-    check_api() >> write(fetch())
+    status = check_api()
+    data = fetch(status)
+    write(data)
 
-ipma_stations_raw_to_minio_parquet()
+ipma_stations()
