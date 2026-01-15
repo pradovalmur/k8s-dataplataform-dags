@@ -41,10 +41,18 @@ def ipma_stations():
     def fetch(_: int) -> list[dict]:
         r = requests.get(IPMA_URL, timeout=60)
         r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
-            raise ValueError("stations.json: esperado array JSON")
-        return data
+
+        payload = r.json()
+
+        # stations.json esperado: lista de Features
+        if not isinstance(payload, list):
+            raise ValueError(f"stations.json: esperado list, veio {type(payload)}")
+
+        # valida mínima: cada item precisa ser dict
+        if payload and not isinstance(payload[0], dict):
+            raise ValueError("stations.json: esperado lista de objetos")
+
+        return payload
 
     @task
     def write(data: list[dict]) -> dict:
