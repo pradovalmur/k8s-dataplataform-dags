@@ -1,4 +1,0 @@
-pandas
-pyarrow
-s3fs
-trino
