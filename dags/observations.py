@@ -19,14 +19,12 @@ def _s3_fs() -> s3fs.S3FileSystem:
     return s3fs.S3FileSystem(
         key=Variable.get("MINIO_ACCESS_KEY"),
         secret=Variable.get("MINIO_SECRET_KEY"),
-        client_kwargs={
-            "endpoint_url": Variable.get("MINIO_ENDPOINT"),
-        },
+        client_kwargs={"endpoint_url": Variable.get("MINIO_ENDPOINT")},
     )
 
 @dag(
     dag_id="ipma_observations_raw_to_minio_parquet",
-    schedule="15 * * * *",  # a cada hora no minuto 15
+    schedule="15 * * * *",
     start_date=datetime(2025, 1, 1),
     catchup=False,
     default_args={"retries": 2, "retry_delay": timedelta(minutes=5)},
@@ -34,15 +32,24 @@ def _s3_fs() -> s3fs.S3FileSystem:
 )
 def ipma_observations_raw_to_minio_parquet():
     @task
-    def fetch_and_write():
-        bucket = Variable.get("RAW_BUCKET")
-        prefix = Variable.get("RAW_PREFIX", "raw/ipma")
+    def check_api() -> int:
+        r = requests.get(IPMA_URL, timeout=60)
+        r.raise_for_status()
+        return r.status_code
 
-        resp = requests.get(IPMA_URL, timeout=60)
-        resp.raise_for_status()
-        data = resp.json()
+    @task
+    def fetch() -> list[dict]:
+        r = requests.get(IPMA_URL, timeout=60)
+        r.raise_for_status()
+        data = r.json()
         if not isinstance(data, list):
             raise ValueError("observations.json: esperado array JSON")
+        return data
+
+    @task
+    def write(data: list[dict]) -> dict:
+        bucket = Variable.get("RAW_BUCKET")
+        prefix = Variable.get("RAW_PREFIX", "raw/ipma")
 
         df = pd.json_normalize(data)
 
@@ -63,6 +70,6 @@ def ipma_observations_raw_to_minio_parquet():
 
         return {"rows": int(len(df)), "path": f"s3://{path}"}
 
-    fetch_and_write()
+    check_api() >> write(fetch())
 
 ipma_observations_raw_to_minio_parquet()
