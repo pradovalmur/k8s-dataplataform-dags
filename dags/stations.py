@@ -1,26 +1,35 @@
-# dags/ipma_stations_raw_to_minio_parquet.py
+# dags/ipma_stations_to_iceberg_raw.py
 from __future__ import annotations
 
+import json
 from datetime import datetime, timedelta, timezone
 
-import pandas as pd
 import requests
-import s3fs
-
 from airflow.decorators import dag, task
 from airflow.models import Variable
+from trino import dbapi
 
 IPMA_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/stations.json"
+
 
 def _now_utc():
     return datetime.now(timezone.utc)
 
-def _s3_fs() -> s3fs.S3FileSystem:
-    return s3fs.S3FileSystem(
-        key=Variable.get("MINIO_ACCESS_KEY"),
-        secret=Variable.get("MINIO_SECRET_KEY"),
-        client_kwargs={"endpoint_url": Variable.get("MINIO_ENDPOINT")},
+
+def _trino_conn():
+    return dbapi.connect(
+        host=Variable.get("TRINO_HOST"),
+        port=int(Variable.get("TRINO_PORT", "8080")),
+        user=Variable.get("TRINO_USER", "airflow"),
+        http_scheme=Variable.get("TRINO_HTTP_SCHEME", "http"),
+        catalog=Variable.get("TRINO_CATALOG", "iceberg"),
+        schema=Variable.get("TRINO_SCHEMA", "raw"),
     )
+
+
+def _sql_escape_literal(s: str) -> str:
+    return s.replace("'", "''")
+
 
 @dag(
     dag_id="ipma_stations",
@@ -28,7 +37,7 @@ def _s3_fs() -> s3fs.S3FileSystem:
     start_date=datetime(2025, 1, 1),
     catchup=False,
     default_args={"retries": 2, "retry_delay": timedelta(minutes=5)},
-    tags=["ipma", "stations"],
+    tags=["ipma", "stations", "iceberg"],
 )
 def ipma_stations():
     @task
@@ -41,43 +50,34 @@ def ipma_stations():
     def fetch(_: int) -> list[dict]:
         r = requests.get(IPMA_URL, timeout=60)
         r.raise_for_status()
-
         payload = r.json()
-
-        # stations.json esperado: lista de Features
         if not isinstance(payload, list):
             raise ValueError(f"stations.json: esperado list, veio {type(payload)}")
-
-        # valida mínima: cada item precisa ser dict
-        if payload and not isinstance(payload[0], dict):
-            raise ValueError("stations.json: esperado lista de objetos")
-
         return payload
 
     @task
-    def write(data: list[dict]) -> dict:
-        bucket = Variable.get("RAW_BUCKET")
-        prefix = Variable.get("RAW_PREFIX", "raw/ipma")
-
-        df = pd.json_normalize(data)
-
+    def insert(payload: list[dict]) -> dict:
         now = _now_utc()
-        df["ingested_at"] = now.isoformat()
-        df["dt"] = now.strftime("%Y-%m-%d")
-
+        ingested_at = now.replace(tzinfo=None).isoformat(sep=" ", timespec="microseconds")
         dt = now.strftime("%Y-%m-%d")
-        ts = now.strftime("%H%M%S")
 
-        path = f"{bucket}/{prefix}/stations/dt={dt}/stations_{ts}.parquet"
+        payload_str = json.dumps(payload, ensure_ascii=False)
+        payload_sql = _sql_escape_literal(payload_str)
 
-        fs = _s3_fs()
-        with fs.open(path, "wb") as f:
-            df.to_parquet(f, index=False, engine="pyarrow")
+        sql = f"""
+        INSERT INTO ipma_stations_raw (ingested_at, dt, payload)
+        VALUES (TIMESTAMP '{ingested_at}', DATE '{dt}', '{payload_sql}')
+        """
 
-        return {"rows": int(len(df)), "path": f"s3://{path}"}
+        conn = _trino_conn()
+        cur = conn.cursor()
+        cur.execute(sql)
+
+        return {"dt": dt, "stations": len(payload), "bytes": len(payload_str)}
 
     status = check_api()
-    data = fetch(status)
-    write(data)
+    payload = fetch(status)
+    insert(payload)
+
 
 ipma_stations()
