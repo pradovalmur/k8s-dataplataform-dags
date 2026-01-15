@@ -39,13 +39,31 @@ def ipma_observations():
 
     @task
     def fetch(_: int) -> list[dict]:
-        # só roda se check_api passou
         r = requests.get(IPMA_URL, timeout=60)
         r.raise_for_status()
-        data = r.json()
-        if not isinstance(data, list):
-            raise ValueError("observations.json: esperado array JSON")
-        return data
+
+        payload = r.json()
+        if not isinstance(payload, dict):
+            raise ValueError(f"observations.json: esperado dict, veio {type(payload)}")
+
+        rows: list[dict] = []
+
+        for observed_at, stations_map in payload.items():
+            if not isinstance(stations_map, dict):
+                continue
+
+            for id_estacao, metrics in stations_map.items():
+                if not isinstance(metrics, dict):
+                    continue
+
+                row = {"observed_at": observed_at, "idEstacao": int(id_estacao)}
+                row.update(metrics)
+                rows.append(row)
+
+        if not rows:
+            raise ValueError("observations.json: payload vazio ou formato inesperado")
+
+        return rows
 
     @task
     def write(data: list[dict]) -> dict:
