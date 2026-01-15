@@ -16,8 +16,13 @@ def _now_utc():
     return datetime.now(timezone.utc)
 
 def _s3_fs() -> s3fs.S3FileSystem:
-    endpoint = Variable.get("MINIO_ENDPOINT")
-    return s3fs.S3FileSystem(client_kwargs={"endpoint_url": endpoint})
+    return s3fs.S3FileSystem(
+        key=Variable.get("MINIO_ACCESS_KEY"),
+        secret=Variable.get("MINIO_SECRET_KEY"),
+        client_kwargs={
+            "endpoint_url": Variable.get("MINIO_ENDPOINT"),
+        },
+    )
 
 @dag(
     dag_id="ipma_stations_raw_to_minio_parquet",
