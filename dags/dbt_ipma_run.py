@@ -31,7 +31,7 @@ with DAG(
     echo "DBT_RUN content:"
     find "$DBT_RUN" -maxdepth 2 -type f -print
 
-    dbt debug --profiles-dir "$DBT_RUN" --project-dir "$DBT_RUN"
+    dbt debug --profiles-dir /tmp/dbt_ipma --project-dir /tmp/dbt_ipma
     """,
     )
 
@@ -40,7 +40,7 @@ with DAG(
         bash_command=f"""
         set -euo pipefail
         DBT_RUN=/tmp/dbt_ipma
-        dbt run --profiles-dir "$DBT_RUN" --project-dir "$DBT_RUN"
+        dbt run --profiles-dir /tmp/dbt_ipma --project-dir /tmp/dbt_ipma
         """,
     )
 
