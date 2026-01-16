@@ -1,14 +1,10 @@
 from datetime import datetime
-import os
-
 from airflow import DAG
 from airflow.operators.bash import BashOperator
 
-# resolve o symlink criado pelo git-sync
-DAGS_REPO = os.path.realpath("/opt/airflow/dags/repo")
-
-# dbt está em dags/dbt/ipma
-DBT_DIR = os.path.join(DAGS_REPO, "dags", "dbt", "ipma")
+# caminho "lógico" via symlink
+DBT_SRC = "/opt/airflow/dags/repo/dags/dbt/ipma"
+DBT_RUN = "/tmp/dbt_ipma"
 
 with DAG(
     dag_id="dbt_ipma_run",
@@ -20,20 +16,31 @@ with DAG(
     dbt_debug = BashOperator(
         task_id="dbt_debug",
         bash_command=f"""
-        set -e
-        echo "DBT_DIR={DBT_DIR}"
-        ls -la {DBT_DIR}
-        cd {DBT_DIR}
-        dbt debug --profiles-dir {DBT_DIR}
+        set -euo pipefail
+
+        echo "DBT_SRC={DBT_SRC}"
+        ls -la /opt/airflow/dags || true
+        ls -la /opt/airflow/dags/repo || true
+        ls -la {DBT_SRC}
+
+        rm -rf {DBT_RUN}
+        mkdir -p {DBT_RUN}
+        cp -R {DBT_SRC}/. {DBT_RUN}/
+
+        echo "DBT_RUN={DBT_RUN}"
+        ls -la {DBT_RUN}
+
+        cd {DBT_RUN}
+        dbt debug --profiles-dir {DBT_RUN}
         """,
     )
 
     dbt_run = BashOperator(
         task_id="dbt_run",
         bash_command=f"""
-        set -e
-        cd {DBT_DIR}
-        dbt run --profiles-dir {DBT_DIR}
+        set -euo pipefail
+        cd {DBT_RUN}
+        dbt run --profiles-dir {DBT_RUN}
         """,
     )
 
