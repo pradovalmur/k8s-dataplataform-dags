@@ -13,25 +13,36 @@ with DAG(
 ) as dag:
 
     dbt_debug = BashOperator(
-        task_id="dbt_debug",
-        bash_command=f"""
-        set -euo pipefail
-        ls -la {DBT_SRC}
-        rm -rf {DBT_RUN}
-        mkdir -p {DBT_RUN}
-        cp -R {DBT_SRC}/. {DBT_RUN}/
-        cd {DBT_RUN}
-        dbt debug --profiles-dir {DBT_RUN}
-        """,
+    task_id="dbt_debug",
+    bash_command=f"""
+    set -euo pipefail
+
+    DBT_SRC=/opt/airflow/dags/repo/dags/dbt/ipma
+    DBT_RUN=/tmp/dbt_ipma
+
+    rm -rf "$DBT_RUN"
+    mkdir -p "$DBT_RUN"
+
+    # copia só o projeto (evita carregar qualquer resíduo)
+    cp "$DBT_SRC/dbt_project.yml" "$DBT_RUN/"
+    cp "$DBT_SRC/profiles.yml" "$DBT_RUN/"
+    cp -R "$DBT_SRC/models" "$DBT_RUN/"
+
+    echo "DBT_RUN content:"
+    find "$DBT_RUN" -maxdepth 2 -type f -print
+
+    dbt debug --profiles-dir "$DBT_RUN" --project-dir "$DBT_RUN"
+    """,
     )
 
     dbt_run = BashOperator(
         task_id="dbt_run",
         bash_command=f"""
         set -euo pipefail
-        cd {DBT_RUN}
-        dbt run --profiles-dir {DBT_RUN}
+        DBT_RUN=/tmp/dbt_ipma
+        dbt run --profiles-dir "$DBT_RUN" --project-dir "$DBT_RUN"
         """,
     )
+
 
     dbt_debug >> dbt_run
