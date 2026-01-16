@@ -1,0 +1,12 @@
+ipma:
+  target: prod
+  outputs:
+    prod:
+      type: trino
+      method: none
+      user: airflow
+      host: trino.analytics.svc.cluster.local
+      port: 8080
+      http_scheme: http
+      catalog: iceberg
+      schema: curated
