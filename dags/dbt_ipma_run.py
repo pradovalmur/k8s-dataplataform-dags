@@ -24,9 +24,8 @@ shared_repo_mount = k8s.V1VolumeMount(
     mount_path=GIT_ROOT,
 )
 
-# garante permissão de escrita no volume para initContainer + container
 pod_security_context = k8s.V1PodSecurityContext(
-    fs_group=0,  # simples e funciona em clusters “soltos”
+    fs_group=0,
     fs_group_change_policy="OnRootMismatch",
 )
 
@@ -83,12 +82,12 @@ with DAG(
     catchup=False,
     tags=["dbt", "ipma"],
 ) as dag:
+
     base_kwargs = dict(
         namespace=NAMESPACE,
         image="pradovalmur/dbt:1.10.7-trino-1.10.1",
         image_pull_policy="Always",
         cmds=["/bin/bash", "-lc"],
-        arguments=[make_cmd("debug")],  # sobrescreve em cada task
         volumes=[shared_repo],
         volume_mounts=[shared_repo_mount],
         init_containers=[git_sync_init],
