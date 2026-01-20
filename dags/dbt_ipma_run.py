@@ -1,6 +1,9 @@
 from datetime import datetime
+
 from airflow import DAG
-from airflow.operators.bash import BashOperator
+from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
+
+DBT_IMAGE = "pradovalmur/dbt:1.10.7-trino-1.10.1"
 
 DBT_SRC = "/opt/airflow/dags/repo/dags/dbt/ipma"
 DBT_RUN = "/tmp/dbt_ipma"
@@ -13,73 +16,81 @@ with DAG(
     tags=["dbt", "ipma"],
 ) as dag:
 
-    dbt_debug = BashOperator(
+    dbt_debug = KubernetesPodOperator(
         task_id="dbt_debug",
-        bash_command=f"""
-        set -euo pipefail
+        namespace="orchestration",
+        image=DBT_IMAGE,
+        name="dbt-ipma-debug",
+        cmds=["/bin/bash", "-lc"],
+        arguments=[f"""
+            set -euo pipefail
 
-        rm -rf "{DBT_RUN}"
-        mkdir -p "{DBT_RUN}"
+            rm -rf "{DBT_RUN}"
+            mkdir -p "{DBT_RUN}"
 
-        # Copia só o que interessa (evita lixo de runs anteriores)
-        cp "{DBT_SRC}/dbt_project.yml" "{DBT_RUN}/"
-        cp "{DBT_SRC}/profiles.yml" "{DBT_RUN}/"
-        cp -R "{DBT_SRC}/models" "{DBT_RUN}/"
+            cp "{DBT_SRC}/dbt_project.yml" "{DBT_RUN}/"
+            cp "{DBT_SRC}/profiles.yml" "{DBT_RUN}/"
+            cp -R "{DBT_SRC}/models" "{DBT_RUN}/"
 
-        echo "=== DBT_SRC ==="
-        ls -la "{DBT_SRC}"
-        echo "=== DBT_RUN ==="
-        find "{DBT_RUN}" -maxdepth 3 -type f -print
+            echo "=== DBT_SRC ==="
+            ls -la "{DBT_SRC}"
+            echo "=== DBT_RUN ==="
+            find "{DBT_RUN}" -maxdepth 3 -type f -print
 
-        echo "=== which dbt ==="
-        which dbt || true
-        ls -la "$(which dbt)" || true
+            echo "=== dbt --version ==="
+            dbt --version
 
-        echo "=== head do binario dbt (se for script) ==="
-        head -n 80 "$(which dbt)" || true
-
-        echo "=== env (DBT/TRINO/SSL/PROXY) ==="
-        env | sort | egrep -i "^(DBT|TRINO|REQUESTS_CA_BUNDLE|CURL_CA_BUNDLE|SSL_CERT_FILE|SSL_CERT_DIR|HTTPS?_PROXY|NO_PROXY)=" || true
-
-        echo "=== dbt_project.yml ==="
-        cat "{DBT_RUN}/dbt_project.yml"
-
-        echo "=== profiles.yml ==="
-        cat "{DBT_RUN}/profiles.yml"
-
-        # Se algum wrapper/env estiver injetando flags globais, zera aqui
-        unset DBT_GLOBAL_FLAGS DBT_FLAGS || true
-
-        echo "=== dbt --version ==="
-        dbt --version
-
-        echo "=== dbt debug ==="
-        dbt debug --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
-        """,
+            echo "=== dbt debug ==="
+            dbt debug --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
+        """],
+        get_logs=True,
+        is_delete_operator_pod=True,
     )
 
-    dbt_run = BashOperator(
+    dbt_run = KubernetesPodOperator(
         task_id="dbt_run",
-        bash_command=f"""
-        set -euo pipefail
+        namespace="orchestration",
+        image=DBT_IMAGE,
+        name="dbt-ipma-run",
+        cmds=["/bin/bash", "-lc"],
+        arguments=[f"""
+            set -euo pipefail
 
-        unset DBT_GLOBAL_FLAGS DBT_FLAGS || true
+            rm -rf "{DBT_RUN}"
+            mkdir -p "{DBT_RUN}"
 
-        echo "=== dbt run ==="
-        dbt run --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
-        """,
+            cp "{DBT_SRC}/dbt_project.yml" "{DBT_RUN}/"
+            cp "{DBT_SRC}/profiles.yml" "{DBT_RUN}/"
+            cp -R "{DBT_SRC}/models" "{DBT_RUN}/"
+
+            echo "=== dbt run ==="
+            dbt run --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
+        """],
+        get_logs=True,
+        is_delete_operator_pod=True,
     )
 
-    dbt_test = BashOperator(
+    dbt_test = KubernetesPodOperator(
         task_id="dbt_test",
-        bash_command=f"""
-        set -euo pipefail
+        namespace="orchestration",
+        image=DBT_IMAGE,
+        name="dbt-ipma-test",
+        cmds=["/bin/bash", "-lc"],
+        arguments=[f"""
+            set -euo pipefail
 
-        unset DBT_GLOBAL_FLAGS DBT_FLAGS || true
+            rm -rf "{DBT_RUN}"
+            mkdir -p "{DBT_RUN}"
 
-        echo "=== dbt test ==="
-        dbt test --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
-        """,
+            cp "{DBT_SRC}/dbt_project.yml" "{DBT_RUN}/"
+            cp "{DBT_SRC}/profiles.yml" "{DBT_RUN}/"
+            cp -R "{DBT_SRC}/models" "{DBT_RUN}/"
+
+            echo "=== dbt test ==="
+            dbt test --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
+        """],
+        get_logs=True,
+        is_delete_operator_pod=True,
     )
 
     dbt_debug >> dbt_run >> dbt_test
