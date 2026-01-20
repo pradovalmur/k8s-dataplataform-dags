@@ -1,4 +1,5 @@
 from datetime import datetime
+
 from airflow import DAG
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from kubernetes.client import models as k8s
@@ -14,6 +15,7 @@ GIT_DEST = "repo"
 DBT_SRC = f"{GIT_ROOT}/{GIT_DEST}/dags/dbt/ipma"
 DBT_RUN = "/tmp/dbt_ipma"
 
+# Shared volume for git-sync -> dbt container
 shared_repo = k8s.V1Volume(
     name="repo",
     empty_dir=k8s.V1EmptyDirVolumeSource(),
@@ -33,13 +35,22 @@ git_sync_init = k8s.V1Container(
         k8s.V1EnvVar(name="GIT_SYNC_ROOT", value=GIT_ROOT),
         k8s.V1EnvVar(name="GIT_SYNC_DEST", value=GIT_DEST),
         k8s.V1EnvVar(name="GIT_SYNC_ONE_TIME", value="true"),
+        # evita ssh known_hosts etc (repo https)
+        k8s.V1EnvVar(name="GIT_SYNC_DEPTH", value="1"),
+        k8s.V1EnvVar(name="GIT_SYNC_MAX_FAILURES", value="-1"),
     ],
     volume_mounts=[shared_repo_mount],
 )
 
-def make_cmd(cmd: str) -> str:
+def make_cmd(subcommand: str) -> str:
+    # subcommand: debug / run / test
     return f"""
 set -euo pipefail
+
+echo "=== repo tree ==="
+ls -la "{GIT_ROOT}" || true
+ls -la "{GIT_ROOT}/{GIT_DEST}" || true
+ls -la "{DBT_SRC}" || true
 
 test -f "{DBT_SRC}/dbt_project.yml"
 test -f "{DBT_SRC}/profiles.yml"
@@ -53,8 +64,11 @@ cp -R "{DBT_SRC}/models" "{DBT_RUN}/"
 
 unset DBT_GLOBAL_FLAGS DBT_FLAGS || true
 
+echo "=== dbt --version ==="
 dbt --version
-dbt {cmd} --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
+
+echo "=== dbt {subcommand} ==="
+dbt {subcommand} --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
 """.strip()
 
 with DAG(
@@ -64,7 +78,6 @@ with DAG(
     catchup=False,
     tags=["dbt", "ipma"],
 ) as dag:
-
     base_kwargs = dict(
         namespace=NAMESPACE,
         image="pradovalmur/dbt:1.10.7-trino-1.10.1",
@@ -74,10 +87,16 @@ with DAG(
         volume_mounts=[shared_repo_mount],
         init_containers=[git_sync_init],
         service_account_name="airflow",
-        is_delete_operator_pod=True,
-        get_logs=True,
         in_cluster=True,
+        get_logs=True,
+        is_delete_operator_pod=True,
         do_xcom_push=False,
+        # evita “Pod not yet started” virar fail cedo
+        startup_timeout_seconds=600,
+        # dá tempo pro dbt em clusters pequenos
+        execution_timeout=None,
+        # padroniza labels
+        labels={"app": "airflow-kpo", "component": "dbt"},
     )
 
     dbt_debug = KubernetesPodOperator(
