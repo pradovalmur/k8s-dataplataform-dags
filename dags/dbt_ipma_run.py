@@ -1,126 +1,88 @@
 from datetime import datetime
 
 from airflow import DAG
-from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-from kubernetes.client import models as k8s
+from airflow.utils.task_group import TaskGroup
+
+from cosmos import DbtTaskGroup, ProjectConfig, ProfileConfig, ExecutionConfig, RenderConfig
+from cosmos.constants import LoadMode
+from cosmos.profiles import ProfileMapping
 
 NAMESPACE = "orchestration"
 
-REPO_URL = "https://github.com/pradovalmur/k8s-dataplataform-dags.git"
-REPO_BRANCH = "main"
+# caminho do repo já montado no pod (o mesmo que funcionou pra você)
+DBT_PROJECT_PATH = "/opt/airflow/dags/repo/dags/dbt/ipma"
+DBT_PROFILES_PATH = DBT_PROJECT_PATH  # profiles.yml dentro do mesmo diretório
 
-WORKDIR = "/workspace"
-REPO_DIR = f"{WORKDIR}/repo"
+DBT_IMAGE = "pradovalmur/dbt:1.10.7-trino-1.10.1"
 
-DBT_SRC = f"{REPO_DIR}/dags/dbt/ipma"
-DBT_RUN = "/tmp/dbt_ipma"
-
-# Volume efêmero (por Pod do KPO)
-repo_vol = k8s.V1Volume(
-    name="repo",
-    empty_dir=k8s.V1EmptyDirVolumeSource(),
-)
-repo_mount = k8s.V1VolumeMount(
-    name="repo",
-    mount_path=WORKDIR,
+# Ajuste pra sua config do profiles.yml
+# Opção 1 (mais simples): Cosmos lê o profiles.yml do volume
+profile_config = ProfileConfig(
+    profile_name="ipma",         # nome do profile dentro do profiles.yml
+    target_name="dev",           # target dentro do profiles.yml
+    profiles_yml_filepath=f"{DBT_PROFILES_PATH}/profiles.yml",
 )
 
-# Init container: faz clone do repo (mais confiável que git-sync aqui)
-git_clone_init = k8s.V1Container(
-    name="git-clone",
-    image="alpine/git:2.45.2",
-    image_pull_policy="IfNotPresent",
-    command=["/bin/sh", "-lc"],
-    args=[
-        f"""
-        set -euo pipefail
-        rm -rf "{REPO_DIR}"
-        mkdir -p "{WORKDIR}"
-
-        echo "Clonando repo..."
-        git clone --depth 1 --branch "{REPO_BRANCH}" "{REPO_URL}" "{REPO_DIR}"
-
-        echo "Repo clonado em: {REPO_DIR}"
-        ls -la "{REPO_DIR}" | head -n 50
-        """.strip()
-    ],
-    volume_mounts=[repo_mount],
+execution_config = ExecutionConfig(
+    execution_mode="kubernetes",
+    kubernetes_namespace=NAMESPACE,
+    kubernetes_service_account_name="airflow",
+    kubernetes_image=DBT_IMAGE,
+    # se precisar setar env no pod (TRINO_PASSWORD etc), dá pra adicionar aqui
+    # env_vars={"TRINO_PASSWORD": "..."},
 )
 
-def make_cmd(subcommand: str) -> str:
-    # roda no container principal (imagem do dbt)
-    return f"""
-set -euo pipefail
+project_config = ProjectConfig(
+    dbt_project_path=DBT_PROJECT_PATH,
+)
 
-echo "=== sanity ==="
-id
-ls -la "{WORKDIR}" || true
-ls -la "{REPO_DIR}" || true
-ls -la "{DBT_SRC}" || true
+# aqui você controla como o Cosmos “descobre” o DAG dbt
+render_config = RenderConfig(
+    load_method=LoadMode.DBT_LS,  # usa `dbt ls` pra listar nodes
+    # seleção: só alguns modelos (recomendado pra começar)
+    select=["stg_ipma_observations"],
+    # para todos os models: tira o select e usa o dbt graph inteiro
+    # select=["path:models"],
+)
 
-test -f "{DBT_SRC}/dbt_project.yml"
-test -f "{DBT_SRC}/profiles.yml"
-
-rm -rf "{DBT_RUN}"
-mkdir -p "{DBT_RUN}"
-
-cp "{DBT_SRC}/dbt_project.yml" "{DBT_RUN}/"
-cp "{DBT_SRC}/profiles.yml" "{DBT_RUN}/"
-cp -R "{DBT_SRC}/models" "{DBT_RUN}/"
-
-unset DBT_GLOBAL_FLAGS DBT_FLAGS || true
-
-echo "=== dbt --version ==="
-dbt --version
-
-echo "=== dbt {subcommand} ==="
-dbt {subcommand} --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
-""".strip()
 
 with DAG(
-    dag_id="dbt_ipma_run",
+    dag_id="dbt_ipma_cosmos",
     start_date=datetime(2025, 1, 1),
     schedule=None,
     catchup=False,
-    tags=["dbt", "ipma"],
+    tags=["dbt", "ipma", "cosmos"],
 ) as dag:
 
-    base_kwargs = dict(
-        namespace=NAMESPACE,
-        image="pradovalmur/dbt:1.10.7-trino-1.10.1",
-        image_pull_policy="Always",
-        cmds=["/bin/bash", "-lc"],
-        volumes=[repo_vol],
-        volume_mounts=[repo_mount],
-        init_containers=[git_clone_init],
-        service_account_name="airflow",
-        in_cluster=True,
-        get_logs=True,
-        is_delete_operator_pod=True,
-        do_xcom_push=False,
-        startup_timeout_seconds=600,
-        labels={"app": "airflow-kpo", "component": "dbt"},
+    # taskgroup de “run”
+    tg_run = DbtTaskGroup(
+        group_id="dbt_run",
+        project_config=project_config,
+        profile_config=profile_config,
+        execution_config=execution_config,
+        render_config=render_config,
+        operator_args={
+            # esses args vão pro KubernetesPodOperator que o Cosmos cria por baixo
+            "get_logs": True,
+            "is_delete_operator_pod": True,
+            "image_pull_policy": "Always",
+        },
+        # por padrão ele roda dbt run nos nodes selecionados
     )
 
-    dbt_debug = KubernetesPodOperator(
-        task_id="dbt_debug",
-        name="dbt-ipma-debug",
-        arguments=[make_cmd("debug")],
-        **base_kwargs,
+    # taskgroup de “test” (mesma seleção, mas comando test)
+    tg_test = DbtTaskGroup(
+        group_id="dbt_test",
+        project_config=project_config,
+        profile_config=profile_config,
+        execution_config=execution_config,
+        render_config=render_config,
+        operator_args={
+            "get_logs": True,
+            "is_delete_operator_pod": True,
+            "image_pull_policy": "Always",
+        },
+        dbt_command="test",
     )
 
-    dbt_run = KubernetesPodOperator(
-        task_id="dbt_run",
-        name="dbt-ipma-run",
-        arguments=[make_cmd("run")],
-        **base_kwargs,
-    )
-
-    dbt_test = KubernetesPodOperator(
-        task_id="dbt_test",
-        name="dbt-ipma-test",
-        arguments=[make_cmd("test")],
-        **base_kwargs,
-    )
-
-    dbt_debug >> dbt_run >> dbt_test
+    tg_run >> tg_test
