@@ -59,4 +59,3 @@ select
     try_cast(json_extract_scalar(station_json, '$.precAcumulada') as double)          as prec_acumulada
 
 from by_station
-;
