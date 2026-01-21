@@ -1,10 +1,11 @@
 version: 2
 
 sources:
-  - name: ipma_raw
-    schema: raw          # <-- ajuste
+  - name: raw
+    database: iceberg
+    schema: raw
     tables:
-      - name: ipma_observations_raw    # <-- ajuste
+      - name: ipma_observations_raw
 
 models:
   - name: stg_ipma_observations

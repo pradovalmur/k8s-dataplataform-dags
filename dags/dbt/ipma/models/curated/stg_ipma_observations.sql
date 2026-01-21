@@ -6,7 +6,7 @@ with src as (
         dt,
         hour,
         observations
-    from {{ source('ipma_raw', 'observations') }}
+    from {{ source('raw', 'ipma_observations_raw') }}
 ),
 
 -- observations é VARCHAR/JSON: {"2026-01-19T00:00": {"1210881": {...}, "1210883": {...}}}
