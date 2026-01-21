@@ -1,18 +1,15 @@
 version: 2
 
 sources:
-  - name: ipma
-    schema: raw
+  - name: ipma_raw
+    schema: raw          # <-- ajuste
     tables:
-      - name: ipma_observations_raw
-        description: "Observações IPMA cruas; payload é JSON com {timestamp -> {station_id -> medidas}}"
+      - name: ipma_observations_raw    # <-- ajuste
 
 models:
   - name: stg_ipma_observations
-    description: "Observações normalizadas (1 linha por station_id + timestamp)"
     columns:
-      - name: ingested_at
       - name: dt
-      - name: hour
-      - name: observation_ts
+        tests: [not_null]
       - name: station_id
+        tests: [not_null]

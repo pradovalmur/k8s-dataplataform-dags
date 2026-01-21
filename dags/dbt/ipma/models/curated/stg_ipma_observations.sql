@@ -1,90 +1,62 @@
-{{ config(materialized='view') }}
+{{ config(materialized='table') }}
 
 with src as (
-
     select
         ingested_at,
         dt,
         hour,
-        payload as payload_json_str
-    from {{ source('ipma', 'observations') }}
-
+        observations
+    from {{ source('ipma_raw', 'observations') }}
 ),
 
-by_ts as (
-
+-- observations é VARCHAR/JSON: {"2026-01-19T00:00": {"1210881": {...}, "1210883": {...}}}
+parsed as (
     select
         ingested_at,
         dt,
         hour,
-        cast(json_parse(payload_json_str) as map(varchar, json)) as ts_map
+        cast(json_parse(observations) as map(varchar, json)) as by_ts
     from src
-
 ),
 
-ts_rows as (
-
+by_timestamp as (
     select
         ingested_at,
         dt,
         hour,
         ts_key,
-        ts_value
-    from by_ts
-    cross join unnest(map_entries(ts_map)) as t(ts_key, ts_value)
-
+        cast(ts_val as map(varchar, json)) as by_station
+    from parsed
+    cross join unnest(map_entries(by_ts)) as t(ts_key, ts_val)
 ),
 
 by_station as (
-
-    select
-        ingested_at,
-        dt,
-        hour,
-        ts_key,
-        cast(ts_value as map(varchar, json)) as station_map
-    from ts_rows
-
-),
-
-station_rows as (
-
     select
         ingested_at,
         dt,
         hour,
         ts_key,
         station_id,
-        measures
-    from by_station
-    cross join unnest(map_entries(station_map)) as s(station_id, measures)
-
+        station_json
+    from by_timestamp
+    cross join unnest(map_entries(by_station)) as s(station_id, station_json)
 )
 
 select
     ingested_at,
     dt,
     hour,
+    ts_key as observation_ts,
+    cast(station_id as varchar) as station_id,
 
-    -- timestamp da observação vindo da chave do JSON (ex: "2026-01-19T00:00" ou "2026-01-18T07:00")
-    coalesce(
-        try(from_iso8601_timestamp(ts_key)),
-        try(date_parse(ts_key, '%Y-%m-%dT%H:%i'))
-    ) as observation_ts,
+    try_cast(json_extract_scalar(station_json, '$.temperatura') as double)            as temperatura,
+    try_cast(json_extract_scalar(station_json, '$.humidade') as double)               as humidade,
+    try_cast(json_extract_scalar(station_json, '$.pressao') as double)                as pressao,
+    try_cast(json_extract_scalar(station_json, '$.radiacao') as double)               as radiacao,
+    try_cast(json_extract_scalar(station_json, '$.intensidadeVento') as double)       as intensidade_vento,
+    try_cast(json_extract_scalar(station_json, '$.intensidadeVentoKM') as double)     as intensidade_vento_km,
+    try_cast(json_extract_scalar(station_json, '$.idDireccVento') as integer)         as id_direcc_vento,
+    try_cast(json_extract_scalar(station_json, '$.precAcumulada') as double)          as prec_acumulada
 
-    cast(station_id as bigint) as station_id,
-
-    -- campos (ajuste/adicione conforme seu JSON)
-    cast(json_extract_scalar(measures, '$.temperatura')          as double) as temperatura,
-    cast(json_extract_scalar(measures, '$.humidade')             as double) as humidade,
-    cast(json_extract_scalar(measures, '$.pressao')              as double) as pressao,
-    cast(json_extract_scalar(measures, '$.radiacao')             as double) as radiacao,
-    cast(json_extract_scalar(measures, '$.precAcumulada')        as double) as prec_acumulada,
-    cast(json_extract_scalar(measures, '$.intensidadeVento')      as double) as intensidade_vento,
-    cast(json_extract_scalar(measures, '$.intensidadeVentoKM')    ass double) as intensidade_vento_km,
-    cast(json_extract_scalar(measures, '$.idDireccVento')         as integer) as id_direcc_vento,
-
-    measures as measures_json
-
-from station_rows
+from by_station
 ;
