@@ -13,7 +13,6 @@ DBT_IMAGE = "pradovalmur/dbt:1.10.7-trino-1.10.1"
 REPO_URL = "https://github.com/pradovalmur/k8s-dataplataform-dags.git"
 REPO_BRANCH = "main"
 
-# dentro do repo:
 DBT_PROJECT_REL = "dags/dbt/ipma"
 DBT_RUN = "/tmp/dbt_ipma"
 
@@ -21,6 +20,7 @@ def bash_cmd(dbt_cmd: str) -> str:
     return f"""
 set -euo pipefail
 
+# instala git (se a imagem já tiver, isso não quebra)
 apk add --no-cache git >/dev/null 2>&1 || true
 
 rm -rf /tmp/repo
@@ -59,7 +59,6 @@ BASE_KPO = dict(
     is_delete_operator_pod=True,
     get_logs=True,
     do_xcom_push=False,
-    # dá mais folga pro pull da imagem se precisar
     startup_timeout_seconds=600,
 )
 
@@ -78,14 +77,14 @@ with DAG(
             dbt_run = KubernetesPodOperator(
                 task_id=f"run__{model}",
                 name=f"dbt-run-{model}".replace("_", "-"),
-                arguments=bash_cmd(f"run --select {model}"),
+                arguments=[bash_cmd(f"run --select {model}")],  # <-- LISTA
                 **BASE_KPO,
             )
 
             dbt_test = KubernetesPodOperator(
                 task_id=f"test__{model}",
                 name=f"dbt-test-{model}".replace("_", "-"),
-                arguments=bash_cmd(f"test --select {model}"),
+                arguments=[bash_cmd(f"test --select {model}")],  # <-- LISTA
                 **BASE_KPO,
             )
 
