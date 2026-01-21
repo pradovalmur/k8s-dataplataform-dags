@@ -1,57 +1,34 @@
 from __future__ import annotations
 
 from datetime import datetime
-
 from airflow import DAG
 from airflow.utils.task_group import TaskGroup
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
-from kubernetes.client import models as k8s
 
 NAMESPACE = "orchestration"
 SERVICE_ACCOUNT = "airflow"
 
 DBT_IMAGE = "pradovalmur/dbt:1.10.7-trino-1.10.1"
 
-# PVC que contém /opt/airflow/dags + git-sync output
-DAGS_PVC_NAME = "airflow-dags"
+REPO_URL = "https://github.com/pradovalmur/k8s-dataplataform-dags.git"
+REPO_BRANCH = "main"
 
-# Dentro do pod efêmero, vamos montar o PVC aqui:
-DAGS_MOUNT_PATH = "/opt/airflow/dags"
-
-# dbt project fica dentro do repo: dags/dbt/ipma
+# dentro do repo:
 DBT_PROJECT_REL = "dags/dbt/ipma"
-
-# área de execução (cópia local)
 DBT_RUN = "/tmp/dbt_ipma"
-
-dags_volume = k8s.V1Volume(
-    name="dags",
-    persistent_volume_claim=k8s.V1PersistentVolumeClaimVolumeSource(claim_name=DAGS_PVC_NAME),
-)
-
-dags_mount = k8s.V1VolumeMount(
-    name="dags",
-    mount_path=DAGS_MOUNT_PATH,
-    read_only=True,
-)
 
 def bash_cmd(dbt_cmd: str) -> str:
     return f"""
 set -euo pipefail
 
-echo "=== locate worktree ==="
-WT="$(ls -1 {DAGS_MOUNT_PATH}/.worktrees 2>/dev/null | head -n 1 || true)"
-if [ -z "$WT" ]; then
-  echo "ERROR: no worktree found at {DAGS_MOUNT_PATH}/.worktrees"
-  ls -la {DAGS_MOUNT_PATH} || true
-  exit 2
-fi
+apk add --no-cache git >/dev/null 2>&1 || true
 
-REPO="{DAGS_MOUNT_PATH}/.worktrees/$WT"
-DBT_SRC="$REPO/{DBT_PROJECT_REL}"
+rm -rf /tmp/repo
+git clone --depth 1 --branch "{REPO_BRANCH}" "{REPO_URL}" /tmp/repo
+
+DBT_SRC="/tmp/repo/{DBT_PROJECT_REL}"
 
 echo "=== repo check ==="
-ls -la "$REPO" || true
 ls -la "$DBT_SRC" || true
 test -f "$DBT_SRC/dbt_project.yml"
 test -f "$DBT_SRC/profiles.yml"
@@ -77,18 +54,16 @@ BASE_KPO = dict(
     image=DBT_IMAGE,
     image_pull_policy="Always",
     cmds=["/bin/bash", "-lc"],
-    volumes=[dags_volume],
-    volume_mounts=[dags_mount],
     service_account_name=SERVICE_ACCOUNT,
     in_cluster=True,
     is_delete_operator_pod=True,
     get_logs=True,
     do_xcom_push=False,
+    # dá mais folga pro pull da imagem se precisar
+    startup_timeout_seconds=600,
 )
 
-MODELS = [
-    "stg_ipma_observations",
-]
+MODELS = ["stg_ipma_observations"]
 
 with DAG(
     dag_id="dbt_ipma_run",
@@ -103,7 +78,6 @@ with DAG(
             dbt_run = KubernetesPodOperator(
                 task_id=f"run__{model}",
                 name=f"dbt-run-{model}".replace("_", "-"),
-                # args precisa ser string (não lista)
                 arguments=bash_cmd(f"run --select {model}"),
                 **BASE_KPO,
             )
