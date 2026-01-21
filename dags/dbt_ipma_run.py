@@ -7,19 +7,22 @@ from airflow.utils.task_group import TaskGroup
 from airflow.providers.cncf.kubernetes.operators.pod import KubernetesPodOperator
 from kubernetes.client import models as k8s
 
-
 NAMESPACE = "orchestration"
 SERVICE_ACCOUNT = "airflow"
 
 DBT_IMAGE = "pradovalmur/dbt:1.10.7-trino-1.10.1"
 
-# Onde o Airflow já enxerga o repo (sem git-sync na DAG)
-DAGS_MOUNT_PATH = "/opt/airflow/dags"
-DBT_SRC = f"{DAGS_MOUNT_PATH}/repo/dags/dbt/ipma"
-DBT_RUN = "/tmp/dbt_ipma"
+# PVC que contém /opt/airflow/dags + git-sync output
+DAGS_PVC_NAME = "airflow-dags"
 
-# Ajuste pro seu PVC real (o mesmo que o scheduler/webserver/worker usa pros dags)
-DAGS_PVC_NAME = "airflow-dags"  # <-- ajuste
+# Dentro do pod efêmero, vamos montar o PVC aqui:
+DAGS_MOUNT_PATH = "/opt/airflow/dags"
+
+# dbt project fica dentro do repo: dags/dbt/ipma
+DBT_PROJECT_REL = "dags/dbt/ipma"
+
+# área de execução (cópia local)
+DBT_RUN = "/tmp/dbt_ipma"
 
 dags_volume = k8s.V1Volume(
     name="dags",
@@ -36,17 +39,29 @@ def bash_cmd(dbt_cmd: str) -> str:
     return f"""
 set -euo pipefail
 
+echo "=== locate worktree ==="
+WT="$(ls -1 {DAGS_MOUNT_PATH}/.worktrees 2>/dev/null | head -n 1 || true)"
+if [ -z "$WT" ]; then
+  echo "ERROR: no worktree found at {DAGS_MOUNT_PATH}/.worktrees"
+  ls -la {DAGS_MOUNT_PATH} || true
+  exit 2
+fi
+
+REPO="{DAGS_MOUNT_PATH}/.worktrees/$WT"
+DBT_SRC="$REPO/{DBT_PROJECT_REL}"
+
 echo "=== repo check ==="
-ls -la "{DBT_SRC}" || true
-test -f "{DBT_SRC}/dbt_project.yml"
-test -f "{DBT_SRC}/profiles.yml"
+ls -la "$REPO" || true
+ls -la "$DBT_SRC" || true
+test -f "$DBT_SRC/dbt_project.yml"
+test -f "$DBT_SRC/profiles.yml"
 
 rm -rf "{DBT_RUN}"
 mkdir -p "{DBT_RUN}"
 
-cp "{DBT_SRC}/dbt_project.yml" "{DBT_RUN}/"
-cp "{DBT_SRC}/profiles.yml" "{DBT_RUN}/"
-cp -R "{DBT_SRC}/models" "{DBT_RUN}/"
+cp "$DBT_SRC/dbt_project.yml" "{DBT_RUN}/"
+cp "$DBT_SRC/profiles.yml" "{DBT_RUN}/"
+cp -R "$DBT_SRC/models" "{DBT_RUN}/"
 
 unset DBT_GLOBAL_FLAGS DBT_FLAGS || true
 
@@ -73,7 +88,6 @@ BASE_KPO = dict(
 
 MODELS = [
     "stg_ipma_observations",
-    # adicione outros modelos aqui
 ]
 
 with DAG(
@@ -89,14 +103,15 @@ with DAG(
             dbt_run = KubernetesPodOperator(
                 task_id=f"run__{model}",
                 name=f"dbt-run-{model}".replace("_", "-"),
-                arguments=[bash_cmd(f"run --select {model}")],
+                # args precisa ser string (não lista)
+                arguments=bash_cmd(f"run --select {model}"),
                 **BASE_KPO,
             )
 
             dbt_test = KubernetesPodOperator(
                 task_id=f"test__{model}",
                 name=f"dbt-test-{model}".replace("_", "-"),
-                arguments=[bash_cmd(f"test --select {model}")],
+                arguments=bash_cmd(f"test --select {model}"),
                 **BASE_KPO,
             )
 
