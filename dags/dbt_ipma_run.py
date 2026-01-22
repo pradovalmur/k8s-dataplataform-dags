@@ -62,7 +62,7 @@ BASE_KPO = dict(
     startup_timeout_seconds=600,
 )
 
-MODELS = ["stg_ipma_observations"]
+MODELS = ["stg_ipma_observations", "stg_ipma_stations"]
 
 with DAG(
     dag_id="dbt_ipma_run",
