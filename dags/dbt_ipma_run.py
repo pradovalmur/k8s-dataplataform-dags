@@ -18,6 +18,7 @@ GIT_BRANCH = "main"
 DBT_SRC = "/tmp/repo/dags/dbt/ipma"
 DBT_RUN = "/tmp/dbt_ipma"
 
+
 def bash_cmd(dbt_cmd: str) -> str:
     return f"""
 set -euo pipefail
@@ -44,6 +45,7 @@ unset DBT_GLOBAL_FLAGS DBT_FLAGS || true
 echo "=== dbt {dbt_cmd} ==="
 dbt {dbt_cmd} --profiles-dir "{DBT_RUN}" --project-dir "{DBT_RUN}"
 """.strip()
+
 
 BASE_KPO = dict(
     namespace=NAMESPACE,
@@ -95,6 +97,7 @@ with DAG(
             run >> test
 
     with TaskGroup(group_id="delivery") as tg_delivery:
+        prev = None
         for m in DELIVERY_MODELS:
             run = KubernetesPodOperator(
                 task_id=f"run__{m}",
@@ -108,6 +111,12 @@ with DAG(
                 arguments=[bash_cmd(f"test --select {m}")],
                 **BASE_KPO,
             )
+
             run >> test
+
+            # garante sequência: (run+test) do modelo anterior termina antes do próximo começar
+            if prev is not None:
+                prev >> run
+            prev = test
 
     tg_stg >> tg_delivery
