@@ -6,9 +6,14 @@ sources:
     schema: raw
     tables:
       - name: ipma_observations_raw
+      - name: ipma_stations_raw
 
 models:
   - name: stg_ipma_observations
+    columns:
+      - name: dt
+        tests: [not_null]
+  - name: stg_ipma_stations
     columns:
       - name: dt
         tests: [not_null]
