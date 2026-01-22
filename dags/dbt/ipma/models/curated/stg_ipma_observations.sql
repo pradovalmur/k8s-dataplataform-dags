@@ -83,4 +83,4 @@ select
     try_cast(json_extract_scalar(station_payload, '$.pressao') as double)              as pressao
 
 from t4
-;
+
