@@ -1,4 +1,4 @@
-{{ config(materialized='view', schema='delivery') }}
+{{ config(materialized='table', schema='delivery') }}
 
 with f as (
   select * from {{ ref('fact_observation_hourly') }}
