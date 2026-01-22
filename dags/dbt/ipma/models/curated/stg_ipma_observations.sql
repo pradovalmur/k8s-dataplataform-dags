@@ -98,4 +98,3 @@ select
   pressao,
   ingested_at
 from dedup
-;
