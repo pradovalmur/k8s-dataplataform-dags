@@ -20,4 +20,6 @@ models:
     +materialized: table
     curated:
       +materialized: table
+    delivery:
+      +materialized: table
 
