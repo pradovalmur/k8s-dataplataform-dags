@@ -7,6 +7,10 @@ from datetime import datetime, timedelta, timezone
 import requests
 from airflow.decorators import dag, task
 from airflow.models import Variable
+
+from airflow.operators.trigger_dagrun import TriggerDagRunOperator
+from airflow.utils.trigger_rule import TriggerRule
+
 from trino import dbapi
 
 IPMA_URL = "https://api.ipma.pt/open-data/observation/meteorology/stations/observations.json"
@@ -76,9 +80,19 @@ def ipma_observations():
 
         return {"dt": dt, "hour": hour, "bytes": len(payload_str)}
 
+    trigger_dbt_ipma_run = TriggerDagRunOperator(
+        task_id="trigger_dbt_ipma_run",
+        trigger_dag_id="dbt_ipma_run",
+        wait_for_completion=False,
+        reset_dag_run=True,
+        trigger_rule=TriggerRule.ALL_SUCCESS,  # só dispara se insert terminar OK
+    )
+
     status = check_api()
     payload = fetch(status)
-    insert(payload)
+    inserted = insert(payload)
+
+    inserted >> trigger_dbt_ipma_run
 
 
 ipma_observations()
