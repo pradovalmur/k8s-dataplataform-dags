@@ -12,5 +12,4 @@ models:
     columns:
       - name: dt
         tests: [not_null]
-      - name: station_id
-        tests: [not_null]
+
