@@ -5,7 +5,7 @@ with src as (
         dt,
         hour,
         payload
-    from {{ source('ipma_raw', 'ipma_observations_raw') }}
+    from {{ source('raw', 'ipma_observations_raw') }}
 
 ),
 
