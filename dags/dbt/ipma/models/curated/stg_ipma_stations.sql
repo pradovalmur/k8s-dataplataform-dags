@@ -72,4 +72,3 @@ select
   dt,
   ingested_at
 from dedup_station
-;
