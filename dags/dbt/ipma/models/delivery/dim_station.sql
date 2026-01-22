@@ -12,7 +12,7 @@ with ranked as (
       partition by station_id
       order by dt desc, ingested_at desc
     ) as rn
-  from {{ ref('ipma_stations') }}
+  from {{ ref('stg_ipma_stations') }}
 )
 
 select
