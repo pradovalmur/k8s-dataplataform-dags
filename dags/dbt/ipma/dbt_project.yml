@@ -19,7 +19,9 @@ models:
   ipma:
     +materialized: table
     curated:
+      +schema: curated
       +materialized: table
     delivery:
+      +schema: delivery
       +materialized: table
 

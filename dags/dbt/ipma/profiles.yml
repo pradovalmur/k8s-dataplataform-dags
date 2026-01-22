@@ -9,4 +9,4 @@ ipma:
       port: 8080
       http_scheme: http
       catalog: iceberg
-      schema: curated
+      schema: analytics
