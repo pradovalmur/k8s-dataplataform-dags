@@ -39,6 +39,7 @@ mkdir -p "{DBT_RUN}"
 cp "{DBT_SRC}/dbt_project.yml" "{DBT_RUN}/"
 cp "{DBT_SRC}/profiles.yml" "{DBT_RUN}/"
 cp -R "{DBT_SRC}/models" "{DBT_RUN}/"
+cp -R "{DBT_SRC}/macros" "{DBT_RUN}/"
 
 unset DBT_GLOBAL_FLAGS DBT_FLAGS || true
 
