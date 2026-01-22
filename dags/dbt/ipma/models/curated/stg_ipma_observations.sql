@@ -94,4 +94,3 @@ select
   id_direcc_vento,
   ingested_at
 from dedup_station_hour
-;
