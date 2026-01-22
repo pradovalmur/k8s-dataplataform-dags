@@ -1,0 +1,28 @@
+# models/delivery/schema.yml
+version: 2
+
+models:
+  - name: dim_station
+    columns:
+      - name: station_id
+        tests: [not_null, unique]
+
+  - name: fact_observation_hourly
+    columns:
+      - name: station_id
+        tests: [not_null]
+      - name: ts_hour
+        tests: [not_null]
+
+  - name: fact_station_daily
+    columns:
+      - name: station_id
+        tests: [not_null]
+      - name: dt
+        tests: [not_null]
+      - name: hours_present
+
+  - name: fact_station_latest
+    columns:
+      - name: station_id
+        tests: [not_null, unique]
