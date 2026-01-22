@@ -7,31 +7,31 @@ with raw as (
   from {{ source('raw', 'ipma_observations_raw') }}
 ),
 
--- payload: { "2026-01-21T18:00": { "1210881": {...}, "1210883": null, ... }, ... }
-expanded_ts as (
+-- json -> map(varchar, json)
+payload_map as (
   select
-    r.ingested_at,
-    ts_key,
-    ts_obj
-  from raw r
-  cross join unnest(
-    cast(map_entries(cast(json_parse(r.payload) as map(varchar, json))) as array(row(key varchar, value json)))
-  ) as t(e)
-  cross join lateral (
-    select
-      e.key   as ts_key,
-      e.value as ts_obj
-  )
+    ingested_at,
+    cast(json_parse(payload) as map(varchar, json)) as m
+  from raw
 ),
 
--- ts_key => timestamp/date/hour_of_day
+-- explode timestamps (key = '2026-01-21T18:00', value = json do mapa de estações)
+expanded_ts as (
+  select
+    p.ingested_at,
+    e.key   as ts_key,
+    e.value as ts_obj
+  from payload_map p
+  cross join unnest(map_entries(p.m)) as u(e)
+),
+
 typed_ts as (
   select
     ingested_at,
-    from_iso8601_timestamp(replace(ts_key, 'T', 'T')) as observation_ts,
+    from_iso8601_timestamp(ts_key) as observation_ts,
     cast(date(from_iso8601_timestamp(ts_key)) as date) as dt,
     hour(from_iso8601_timestamp(ts_key)) as hour_of_day,
-    ts_obj
+    cast(ts_obj as map(varchar, json)) as stations_map
   from expanded_ts
 ),
 
@@ -41,17 +41,10 @@ expanded_station as (
     t.observation_ts,
     t.dt,
     t.hour_of_day,
-    station_key,
-    station_obj
+    s.key   as station_key,
+    s.value as station_obj
   from typed_ts t
-  cross join unnest(
-    cast(map_entries(cast(t.ts_obj as map(varchar, json))) as array(row(key varchar, value json)))
-  ) as s(e)
-  cross join lateral (
-    select
-      e.key   as station_key,
-      e.value as station_obj
-  )
+  cross join unnest(map_entries(t.stations_map)) as u(s)
   where station_obj is not null
 ),
 
@@ -74,7 +67,6 @@ final_typed as (
   from expanded_station
 ),
 
--- ✅ dedup definitivo: 1 linha por station_id + observation_ts (logo 1 por hora)
 dedup as (
   select *
   from (
